@@ -394,6 +394,120 @@ def construir_rasante_vial(df, eje_xy, pendientes_tramos):
     }
 
 
+
+def interpolar_rasante_en_estacion(rasante, estacion_objetivo):
+    estaciones = rasante["estaciones"]
+    xy = rasante["xy"]
+
+    x = np.interp(estacion_objetivo, estaciones, xy[:, 0])
+    y = np.interp(estacion_objetivo, estaciones, xy[:, 1])
+    z_terreno = np.interp(estacion_objetivo, estaciones, rasante["z_terreno"])
+    z_rasante = np.interp(estacion_objetivo, estaciones, rasante["z_rasante"])
+
+    return np.array([x, y]), z_terreno, z_rasante
+
+
+def calcular_volumen_acumulado_rasante(rasante, ancho_via):
+    estaciones = rasante["estaciones"]
+    z_terreno = rasante["z_terreno"]
+    z_rasante = rasante["z_rasante"]
+
+    volumenes = [0.0]
+    cortes = [0.0]
+    rellenos = [0.0]
+
+    for i in range(len(estaciones) - 1):
+        longitud_tramo = estaciones[i + 1] - estaciones[i]
+        dif_1 = z_rasante[i] - z_terreno[i]
+        dif_2 = z_rasante[i + 1] - z_terreno[i + 1]
+        diferencia_media = (dif_1 + dif_2) / 2
+        volumen = abs(diferencia_media) * ancho_via * longitud_tramo
+
+        volumenes.append(volumenes[-1] + volumen)
+
+        if diferencia_media < 0:
+            cortes.append(cortes[-1] + volumen)
+            rellenos.append(rellenos[-1])
+        else:
+            cortes.append(cortes[-1])
+            rellenos.append(rellenos[-1] + volumen)
+
+    return np.array(volumenes), np.array(cortes), np.array(rellenos)
+
+
+def recortar_rasante_por_presupuesto(rasante, ancho_via, presupuesto_tierra):
+    presupuesto_tierra = float(presupuesto_tierra)
+    volumen_total, corte_total, relleno_total = calcular_volumen_acumulado_rasante(
+        rasante,
+        ancho_via
+    )
+
+    if presupuesto_tierra <= 0:
+        presupuesto_tierra = 1.0
+
+    if volumen_total[-1] <= presupuesto_tierra:
+        rasante["longitud_total_diseno"] = rasante["longitud_total"]
+        rasante["presupuesto_usado"] = volumen_total[-1]
+        rasante["volumen_corte_estimado"] = corte_total[-1]
+        rasante["volumen_relleno_estimado"] = relleno_total[-1]
+        rasante["presupuesto_suficiente"] = True
+        return rasante
+
+    idx = int(np.searchsorted(volumen_total, presupuesto_tierra, side="right"))
+    idx = max(1, min(idx, len(volumen_total) - 1))
+
+    volumen_anterior = volumen_total[idx - 1]
+    volumen_segmento = volumen_total[idx] - volumen_anterior
+    if volumen_segmento <= 0:
+        fraccion = 0.0
+    else:
+        fraccion = (presupuesto_tierra - volumen_anterior) / volumen_segmento
+        fraccion = float(np.clip(fraccion, 0.0, 1.0))
+
+    estacion_inicio = rasante["estaciones"][idx - 1]
+    estacion_fin = rasante["estaciones"][idx]
+    estacion_corte = estacion_inicio + fraccion * (estacion_fin - estacion_inicio)
+
+    xy_corte, z_terreno_corte, z_rasante_corte = interpolar_rasante_en_estacion(
+        rasante,
+        estacion_corte
+    )
+
+    incluir = rasante["estaciones"] < estacion_corte
+
+    estaciones_nuevas = list(rasante["estaciones"][incluir])
+    xy_nuevas = list(rasante["xy"][incluir])
+    z_terreno_nuevo = list(rasante["z_terreno"][incluir])
+    z_rasante_nuevo = list(rasante["z_rasante"][incluir])
+
+    if len(estaciones_nuevas) == 0:
+        estaciones_nuevas = [0.0]
+        xy_nuevas = [rasante["xy"][0]]
+        z_terreno_nuevo = [rasante["z_terreno"][0]]
+        z_rasante_nuevo = [rasante["z_rasante"][0]]
+
+    if estacion_corte > estaciones_nuevas[-1]:
+        estaciones_nuevas.append(estacion_corte)
+        xy_nuevas.append(xy_corte)
+        z_terreno_nuevo.append(z_terreno_corte)
+        z_rasante_nuevo.append(z_rasante_corte)
+
+    rasante_recortada = {
+        "xy": np.array(xy_nuevas),
+        "estaciones": np.array(estaciones_nuevas),
+        "z_terreno": np.array(z_terreno_nuevo),
+        "z_rasante": np.array(z_rasante_nuevo),
+        "longitud_total": float(estacion_corte),
+        "longitud_total_diseno": float(rasante["longitud_total"]),
+        "presupuesto_usado": float(presupuesto_tierra),
+        "volumen_corte_estimado": float(np.interp(estacion_corte, rasante["estaciones"], corte_total)),
+        "volumen_relleno_estimado": float(np.interp(estacion_corte, rasante["estaciones"], relleno_total)),
+        "presupuesto_suficiente": False
+    }
+
+    return rasante_recortada
+
+
 def calcular_bordes_via(rasante, ancho_via):
     xy = rasante["xy"]
 
@@ -934,34 +1048,92 @@ def generar_memoria_pdf(nombre_proyecto, resumen, simulaciones, capturas):
     if FPDF is None:
         raise ModuleNotFoundError("Instala fpdf2 con: pip install fpdf2")
 
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
+    class MemoriaPDF(FPDF):
+        def header(self):
+            if self.page_no() == 1:
+                return
+            self.set_fill_color(36, 62, 82)
+            self.rect(0, 0, 210, 12, "F")
+            self.set_text_color(255, 255, 255)
+            self.set_font("Helvetica", "B", 9)
+            self.cell(0, 8, texto_pdf("Memoria de Calculo - Diseño Vial y Movimiento de Tierras"), ln=True, align="C")
+            self.set_text_color(0, 0, 0)
 
+        def footer(self):
+            self.set_y(-15)
+            self.set_draw_color(180, 180, 180)
+            self.line(15, self.get_y(), 195, self.get_y())
+            self.set_y(-12)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(90, 90, 90)
+            self.cell(0, 8, texto_pdf(f"Pagina {self.page_no()}"), align="C")
+            self.set_text_color(0, 0, 0)
+
+    def titulo_seccion(pdf, titulo):
+        pdf.ln(4)
+        pdf.set_fill_color(230, 236, 242)
+        pdf.set_text_color(36, 62, 82)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 9, texto_pdf(titulo), ln=True, fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
+
+    def fila_tabla(pdf, izquierda, derecha, fill=False):
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_fill_color(247, 249, 251 if fill else 255)
+        pdf.cell(70, 8, texto_pdf(izquierda), border=1, fill=fill)
+        pdf.cell(70, 8, texto_pdf(derecha), border=1, ln=True, fill=fill)
+
+    pdf = MemoriaPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
     fecha = datetime.now().strftime("%Y-%m-%d")
 
+    # Portada
     pdf.add_page()
+    pdf.set_fill_color(36, 62, 82)
+    pdf.rect(0, 0, 210, 55, "F")
+    pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 16)
+    pdf.ln(14)
     pdf.cell(0, 10, texto_pdf("Universidad / Carrera"), ln=True, align="C")
-    pdf.ln(8)
-
-    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_font("Helvetica", "B", 20)
     pdf.multi_cell(
         0,
-        10,
+        11,
         texto_pdf("Memoria de Calculo - Diseño Vial y Movimiento de Tierras"),
         align="C"
     )
 
-    pdf.ln(10)
-    pdf.set_font("Helvetica", "", 12)
-    pdf.cell(0, 8, texto_pdf(f"Proyecto: {nombre_proyecto}"), ln=True, align="C")
-    pdf.cell(0, 8, texto_pdf(f"Fecha: {fecha}"), ln=True, align="C")
-
-    pdf.add_page()
+    pdf.set_text_color(40, 40, 40)
+    pdf.ln(28)
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, texto_pdf("1. Resumen del Proyecto"), ln=True)
-
+    pdf.cell(0, 10, texto_pdf(f"Proyecto: {nombre_proyecto}"), ln=True, align="C")
     pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, texto_pdf(f"Fecha de emision: {fecha}"), ln=True, align="C")
+    pdf.ln(20)
+    pdf.set_draw_color(36, 62, 82)
+    pdf.set_line_width(0.7)
+    pdf.line(35, pdf.get_y(), 175, pdf.get_y())
+    pdf.ln(8)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(
+        0,
+        7,
+        texto_pdf("Documento tecnico generado a partir de los parametros, calculos volumetricos y simulaciones guardadas en la aplicacion."),
+        align="C"
+    )
+
+    # Resumen
+    pdf.add_page()
+    titulo_seccion(pdf, "1. Resumen Ejecutivo del Proyecto")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(
+        0,
+        7,
+        texto_pdf("Este resumen presenta los parametros de diseño y resultados volumetricos vigentes al momento de generar la memoria."),
+    )
+    pdf.ln(3)
+
     datos = [
         ("Ancho de via", f"{resumen['ancho']:.2f} m"),
         ("Presupuesto de tierra", f"{resumen['presupuesto']:.2f} m3"),
@@ -970,29 +1142,38 @@ def generar_memoria_pdf(nombre_proyecto, resumen, simulaciones, capturas):
         ("Volumen de relleno", f"{resumen['relleno']:.2f} m3"),
     ]
 
-    for etiqueta, valor in datos:
-        pdf.cell(70, 8, texto_pdf(etiqueta), border=1)
-        pdf.cell(70, 8, texto_pdf(valor), border=1, ln=True)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(36, 62, 82)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(70, 8, texto_pdf("Parametro"), border=1, fill=True)
+    pdf.cell(70, 8, texto_pdf("Valor"), border=1, ln=True, fill=True)
+    pdf.set_text_color(0, 0, 0)
 
-    pdf.ln(8)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, texto_pdf("2. Tabla Comparativa de Simulaciones"), ln=True)
+    for idx, (etiqueta, valor) in enumerate(datos):
+        fila_tabla(pdf, etiqueta, valor, fill=idx % 2 == 0)
+
+    # Tabla comparativa
+    titulo_seccion(pdf, "2. Tabla Comparativa de Simulaciones")
 
     if simulaciones.empty:
         pdf.set_font("Helvetica", "", 11)
         pdf.multi_cell(0, 8, texto_pdf("No existen simulaciones guardadas en la base de datos."))
     else:
         pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(36, 62, 82)
+        pdf.set_text_color(255, 255, 255)
         columnas = ["nombre", "ancho", "presupuesto", "longitud_lograda", "corte", "relleno"]
         anchos = [42, 22, 28, 32, 30, 30]
 
         for col, ancho in zip(columnas, anchos):
-            pdf.cell(ancho, 7, texto_pdf(col), border=1)
+            pdf.cell(ancho, 7, texto_pdf(col), border=1, fill=True)
         pdf.ln()
 
+        pdf.set_text_color(0, 0, 0)
         pdf.set_font("Helvetica", "", 8)
 
-        for _, fila in simulaciones.head(12).iterrows():
+        for row_idx, (_, fila) in enumerate(simulaciones.head(12).iterrows()):
+            pdf.set_fill_color(247, 249, 251 if row_idx % 2 == 0 else 255)
             valores = [
                 str(fila["nombre"])[:22],
                 f"{fila['ancho']:.2f}",
@@ -1003,9 +1184,10 @@ def generar_memoria_pdf(nombre_proyecto, resumen, simulaciones, capturas):
             ]
 
             for valor, ancho in zip(valores, anchos):
-                pdf.cell(ancho, 7, texto_pdf(valor), border=1)
+                pdf.cell(ancho, 7, texto_pdf(valor), border=1, fill=True)
             pdf.ln()
 
+    # Capturas
     titulos = [
         "Figura 1. Modelo 3D del terreno",
         "Figura 2. Trazado vial",
@@ -1023,21 +1205,18 @@ def generar_memoria_pdf(nombre_proyecto, resumen, simulaciones, capturas):
             archivos_temporales.append(ruta_tmp)
 
         pdf.add_page()
-        pdf.set_font("Helvetica", "B", 12)
-
         titulo = titulos[i] if i < len(titulos) else f"Figura {i + 1}. Captura del modelo 3D"
-        pdf.cell(0, 10, texto_pdf(titulo), ln=True, align="C")
+        titulo_seccion(pdf, titulo)
 
         try:
-            pdf.image(ruta_tmp, x=15, y=28, w=180)
+            pdf.image(ruta_tmp, x=15, y=32, w=180)
         except Exception:
             pdf.set_font("Helvetica", "", 10)
             pdf.multi_cell(0, 8, texto_pdf("No se pudo insertar esta imagen en el PDF."))
 
+    # Conclusión
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, texto_pdf("3. Conclusion Automatica"), ln=True)
-
+    titulo_seccion(pdf, "3. Conclusion Automatica")
     pdf.set_font("Helvetica", "", 11)
 
     if resumen["corte"] > resumen["presupuesto"]:
@@ -1053,7 +1232,8 @@ def generar_memoria_pdf(nombre_proyecto, resumen, simulaciones, capturas):
             "detallada y validacion en campo."
         )
 
-    pdf.multi_cell(0, 8, texto_pdf(conclusion))
+    pdf.set_fill_color(247, 249, 251)
+    pdf.multi_cell(0, 8, texto_pdf(conclusion), border=1, fill=True)
 
     salida = pdf.output(dest="S")
 
@@ -1237,44 +1417,53 @@ if archivo is not None:
             st.title("🚜 Simulador Vial y Movimiento de Tierras")
             st.subheader("Fase 6: Geometría y Presupuesto")
 
+            parametros_actuales = st.session_state.parametros_diseno or {
+                "ancho_via": 10.0,
+                "presupuesto_tierra": 40000.0
+            }
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                ancho_via = st.number_input(
+                    "Ancho de vía (W en metros)",
+                    min_value=0.1,
+                    value=float(parametros_actuales.get("ancho_via", 10.0)),
+                    step=0.5
+                )
+
+            with col2:
+                presupuesto_tierra = st.number_input(
+                    "Presupuesto de Tierra (Volumen máximo m³)",
+                    min_value=1.0,
+                    value=float(parametros_actuales.get("presupuesto_tierra", 40000.0)),
+                    step=100.0
+                )
+
+            if st.button("Guardar/Actualizar Parámetros", use_container_width=True):
+                if ancho_via <= 0 or presupuesto_tierra <= 0:
+                    st.error("Ingrese valores mayores que cero.")
+                else:
+                    nuevos_parametros = {
+                        "ancho_via": float(ancho_via),
+                        "presupuesto_tierra": float(presupuesto_tierra)
+                    }
+
+                    parametros_cambiaron = nuevos_parametros != st.session_state.parametros_diseno
+                    st.session_state.parametros_diseno = nuevos_parametros
+
+                    if parametros_cambiaron:
+                        st.session_state.rasante = None
+                        st.session_state.excavacion = None
+                        st.session_state.pdf_memoria = None
+
+                    st.success("Parámetros actualizados. Recalcula la Fase 7 para aplicar los cambios.")
+
             if st.session_state.parametros_diseno is not None:
                 parametros = st.session_state.parametros_diseno
-
-                st.success("Guardado. Avanza a la Fase 7.")
-
                 col1, col2 = st.columns(2)
                 col1.metric("Ancho de vía guardado", f"{parametros['ancho_via']:.2f} m")
                 col2.metric("Presupuesto de tierra guardado", f"{parametros['presupuesto_tierra']:.2f} m³")
-
-            else:
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    ancho_via = st.number_input(
-                        "Ancho de vía (W en metros)",
-                        min_value=0.1,
-                        value=10.0,
-                        step=0.5
-                    )
-
-                with col2:
-                    presupuesto_tierra = st.number_input(
-                        "Presupuesto de Tierra (Volumen máximo m³)",
-                        min_value=1.0,
-                        value=40000.0,
-                        step=100.0
-                    )
-
-                if st.button("Guardar Parámetros", use_container_width=True):
-                    if ancho_via <= 0 or presupuesto_tierra <= 0:
-                        st.error("Ingrese valores mayores que cero.")
-                    else:
-                        st.session_state.parametros_diseno = {
-                            "ancho_via": ancho_via,
-                            "presupuesto_tierra": presupuesto_tierra
-                        }
-
-                        st.success("Guardado. Avanza a la Fase 7.")
 
         elif opcion == "Diseño de Eje y Rasante":
             st.subheader("🛣️ Diseño de Eje y Rasante")
@@ -1345,19 +1534,33 @@ if archivo is not None:
                             st.warning("Pendiente alta")
 
                 if st.button("Calcular Rasante Multitramo en 3D", use_container_width=True):
-                    rasante = construir_rasante_vial(
+                    rasante_completa = construir_rasante_vial(
                         df=df,
                         eje_xy=eje_vial["xy"],
                         pendientes_tramos=pendientes_tramos
                     )
 
+                    rasante = recortar_rasante_por_presupuesto(
+                        rasante=rasante_completa,
+                        ancho_via=ancho_via,
+                        presupuesto_tierra=parametros["presupuesto_tierra"]
+                    )
+
                     st.session_state.eje_vial = eje_vial
                     st.session_state.rasante = rasante
                     st.session_state.pendientes_tramos = pendientes_tramos
-                    st.session_state.longitud_total = longitud_total
+                    st.session_state.longitud_total = rasante["longitud_total"]
                     st.session_state.excavacion = None
+                    st.session_state.pdf_memoria = None
 
-                    st.success("¡COMPLETADO!")
+                    if rasante.get("presupuesto_suficiente", False):
+                        st.success("¡COMPLETADO! El presupuesto permite construir todo el eje.")
+                    else:
+                        st.warning(
+                            "El presupuesto limita la construcción hasta "
+                            f"{rasante['longitud_total']:.2f} m de "
+                            f"{rasante['longitud_total_diseno']:.2f} m diseñados."
+                        )
 
                 if st.session_state.rasante is not None:
                     rasante = st.session_state.rasante
@@ -1496,10 +1699,13 @@ if archivo is not None:
 
                 st.session_state.excavacion = {
                     "longitud_construida": rasante["longitud_total"],
+                    "longitud_total_diseno": rasante.get("longitud_total_diseno", rasante["longitud_total"]),
                     "volumen_corte": volumen_corte,
                     "volumen_relleno": volumen_relleno,
+                    "volumen_total": volumen_corte + volumen_relleno,
                     "ancho_via": ancho_via,
-                    "presupuesto": parametros["presupuesto_tierra"]
+                    "presupuesto": parametros["presupuesto_tierra"],
+                    "presupuesto_suficiente": rasante.get("presupuesto_suficiente", True)
                 }
 
                 fig.add_trace(go.Scatter3d(
